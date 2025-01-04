@@ -15,8 +15,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
+use toml;
 use twox_hash::XxHash64;
 use walkdir::WalkDir;
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    #[serde(default)]
+    aliases: HashMap<String, String>,
+}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -44,6 +51,10 @@ struct Args {
     /// Show only cached entries
     #[arg(long)]
     cached: bool,
+
+    /// Use a predefined alias from config file
+    #[arg(short = 'a', long)]
+    alias: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -85,6 +96,293 @@ struct Cache {
 }
 
 static CACHE: Lazy<Mutex<Option<Cache>>> = Lazy::new(|| Mutex::new(None));
+
+fn get_config_file() -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
+    Ok(home.join(".mediainfo").join("config.toml"))
+}
+
+fn load_config() -> Result<Config> {
+    let config_path = get_config_file()?;
+    if config_path.exists() {
+        let content = fs::read_to_string(&config_path)?;
+        Ok(toml::from_str(&content)?)
+    } else {
+        Ok(Config {
+            aliases: HashMap::new(),
+        })
+    }
+}
+
+fn apply_alias(args: &mut Args) -> Result<()> {
+    if let Some(alias_name) = &args.alias {
+        let config = load_config()?;
+        if let Some(alias_args) = config.aliases.get(alias_name) {
+            // Split the alias string into arguments
+            let mut parts = Vec::new();
+            let mut current = String::new();
+            let mut in_quotes = false;
+
+            for c in alias_args.chars() {
+                match c {
+                    '"' => {
+                        in_quotes = !in_quotes;
+                        // Don't include the quotes in the final string
+                    }
+                    ' ' if !in_quotes => {
+                        if !current.is_empty() {
+                            parts.push(current);
+                            current = String::new();
+                        }
+                    }
+                    _ => current.push(c),
+                }
+            }
+            if !current.is_empty() {
+                parts.push(current);
+            }
+
+            // Parse and apply each argument
+            let mut i = 0;
+            while i < parts.len() {
+                match parts[i].as_str() {
+                    "--sort" | "-s" => {
+                        if i + 1 < parts.len() {
+                            args.sort = parts[i + 1].clone();
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    "--direction" | "-d" => {
+                        if i + 1 < parts.len() {
+                            args.direction = parts[i + 1].clone();
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    "--filter" | "-f" => {
+                        if i + 1 < parts.len() {
+                            // Always add filters from alias (they will be combined with AND logic)
+                            args.filter.push(parts[i + 1].clone());
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    "--filename-length" | "-l" => {
+                        if i + 1 < parts.len() {
+                            if let Ok(len) = parts[i + 1].parse() {
+                                args.filename_length = len;
+                            }
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+        } else {
+            eprintln!("Warning: Alias '{}' not found in config file", alias_name);
+        }
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let mut args = Args::parse();
+
+    // Apply alias settings if specified
+    apply_alias(&mut args)?;
+
+    let files = if args.cached {
+        // Get files from cache
+        let cached_files = get_cached_files()?;
+        if cached_files.is_empty() {
+            eprintln!("No cached entries found!");
+            return Ok(());
+        }
+        cached_files
+    } else {
+        // Collect all media files
+        let media_files = collect_media_files(args.paths);
+        if media_files.is_empty() {
+            eprintln!("No media files found!");
+            return Ok(());
+        }
+
+        let process_start = Instant::now();
+        let total_files = media_files.len();
+        let mut processed = 0;
+        let mut cached = 0;
+        let mut processed_files = Vec::new();
+
+        // Process each file
+        for file in media_files {
+            let is_cached = get_cached_probe(&file).ok().flatten().is_some();
+            if is_cached {
+                cached += 1;
+            }
+            match process_file(&file, args.filename_length) {
+                Ok(probe) => {
+                    processed += 1;
+                    eprint!(
+                        "\x1B[2K\rProcessing: {}/{} files ({} from cache) ({})",
+                        processed,
+                        total_files,
+                        cached,
+                        format_elapsed(process_start.elapsed().as_secs_f64())
+                    );
+                    processed_files.push((file, probe));
+                }
+                Err(e) => {
+                    processed += 1;
+                    eprint!(
+                        "\x1B[2K\rProcessing: {}/{} files ({} from cache) ({})",
+                        processed,
+                        total_files,
+                        cached,
+                        format_elapsed(process_start.elapsed().as_secs_f64())
+                    );
+                    eprintln!("\nError processing {}: {}", file.display(), e);
+                }
+            }
+        }
+        eprintln!();
+        processed_files
+    };
+
+    // Create rows for table
+    let mut rows: Vec<(Vec<String>, Row)> = Vec::new();
+    for (file, probe) in files {
+        let fields = format_probe_output(&file, &probe, args.filename_length)?;
+
+        // Apply filters if specified
+        if !args.filter.is_empty() {
+            if !should_include_row(&fields, &args.filter) {
+                continue;
+            }
+        }
+
+        let mut row_cells: Vec<Cell> = Vec::new();
+        for (i, field) in fields.iter().enumerate() {
+            let cell = match i {
+                1 => Cell::new(field).style_spec("r"), // Size
+                2 => Cell::new(field).style_spec("r"), // Duration
+                3 => Cell::new(field).style_spec("r"), // FPS
+                4 => Cell::new(field).style_spec("r"), // Bitrate
+                8 => Cell::new(field).style_spec("c"), // Depth
+                _ => Cell::new(field),                 // Others left-aligned
+            };
+            row_cells.push(cell);
+        }
+        rows.push((fields, Row::new(row_cells)));
+    }
+
+    // Sort rows
+    let sort_index = match args.sort.as_str() {
+        "filename" => 0,
+        "size" => 1,
+        "duration" => 2,
+        "fps" => 3,
+        "bitrate" => 4,
+        "resolution" => 5,
+        "format" => 6,
+        "profile" => 7,
+        "depth" => 8,
+        "audio" => 9,
+        _ => 4, // default to bitrate
+    };
+
+    let ascending = args.direction == "asc";
+    rows.sort_by(|a, b| {
+        let cmp = match sort_index {
+            1 => {
+                // Size
+                let a_bytes = parse_size(&a.0[sort_index]);
+                let b_bytes = parse_size(&b.0[sort_index]);
+                a_bytes.cmp(&b_bytes)
+            }
+            2 => {
+                // Duration
+                let a_secs = parse_duration_to_secs(&a.0[sort_index]);
+                let b_secs = parse_duration_to_secs(&b.0[sort_index]);
+                a_secs
+                    .partial_cmp(&b_secs)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+            3 => {
+                // FPS
+                let a_fps = a.0[sort_index].parse::<f64>().unwrap_or(0.0);
+                let b_fps = b.0[sort_index].parse::<f64>().unwrap_or(0.0);
+                a_fps
+                    .partial_cmp(&b_fps)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+            4 => {
+                // Bitrate
+                let a_bitrate = parse_bitrate(&a.0[sort_index]).unwrap_or(0.0);
+                let b_bitrate = parse_bitrate(&b.0[sort_index]).unwrap_or(0.0);
+                a_bitrate
+                    .partial_cmp(&b_bitrate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+            _ => a.0[sort_index].cmp(&b.0[sort_index]),
+        };
+        if ascending {
+            cmp
+        } else {
+            cmp.reverse()
+        }
+    });
+
+    // Create and print table
+    let mut table = Table::new();
+    let format = format::FormatBuilder::new()
+        .column_separator('│')
+        .borders('│')
+        .separator(
+            format::LinePosition::Top,
+            format::LineSeparator::new('─', '┬', '┌', '┐'),
+        )
+        .separator(
+            format::LinePosition::Bottom,
+            format::LineSeparator::new('─', '┴', '└', '┘'),
+        )
+        .separator(
+            format::LinePosition::Title,
+            format::LineSeparator::new('─', '┼', '├', '┤'),
+        )
+        .padding(1, 1)
+        .build();
+    table.set_format(format);
+
+    // Add header row
+    table.add_row(Row::new(vec![
+        Cell::new("Filename").with_style(Attr::Bold),
+        Cell::new("Size").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("Duration").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("FPS").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("Bitrate").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("Resolution").with_style(Attr::Bold),
+        Cell::new("Format").with_style(Attr::Bold),
+        Cell::new("Profile").with_style(Attr::Bold),
+        Cell::new("Depth").with_style(Attr::Bold).style_spec("c"),
+        Cell::new("Audio").with_style(Attr::Bold),
+    ]));
+
+    // Add sorted rows to table
+    for (_, row) in rows {
+        table.add_row(row);
+    }
+
+    // Print the table
+    table.printstd();
+
+    Ok(())
+}
 
 fn get_file_signature(path: &PathBuf) -> Result<String> {
     let metadata = fs::metadata(path)?;
@@ -369,68 +667,6 @@ fn parse_human_duration(duration_str: &str) -> Option<f64> {
     Some(total_seconds)
 }
 
-fn should_include_row(fields: &[String], filters: &[String]) -> bool {
-    // If no filters, include all rows
-    if filters.is_empty() {
-        return true;
-    }
-
-    // Row must match all filters (AND logic)
-    filters.iter().all(|filter| {
-        let parts: Vec<&str> = filter.split(':').collect();
-        if parts.len() != 2 {
-            return true;
-        }
-
-        let (column, value) = (parts[0], parts[1]);
-
-        // Special handling for filename matching with simplified syntax
-        if column == "filename" {
-            let filename = &fields[0].to_lowercase();
-            let pattern = value.to_lowercase();
-            return filename.contains(&pattern);
-        }
-
-        // For other columns, keep the existing operator-based syntax
-        if parts.len() != 3 {
-            return true;
-        }
-
-        let (column, op, value) = (parts[0], parts[1], parts[2]);
-        let idx = match column {
-            "size" => Some(1),
-            "duration" => Some(2),
-            "fps" => Some(3),
-            "bitrate" => Some(4),
-            _ => None,
-        };
-
-        if let Some(idx) = idx {
-            let field_value = match column {
-                "size" => parse_size(&fields[idx]) as f64,
-                "duration" => parse_duration_to_secs(&fields[idx]),
-                "fps" => fields[idx].parse::<f64>().unwrap_or(0.0),
-                "bitrate" => parse_bitrate(&fields[idx]).unwrap_or(0.0),
-                _ => return true,
-            };
-
-            let threshold = if column == "duration" {
-                parse_human_duration(value).unwrap_or_else(|| value.parse::<f64>().unwrap_or(0.0))
-            } else {
-                value.parse::<f64>().unwrap_or(0.0)
-            };
-
-            match op {
-                ">" => field_value > threshold,
-                "<" => field_value < threshold,
-                _ => true,
-            }
-        } else {
-            true
-        }
-    })
-}
-
 fn process_file(file: &PathBuf, filename_length: usize) -> Result<FFProbeOutput> {
     // Try to get from cache first
     if let Ok(Some(probe)) = get_cached_probe(file) {
@@ -635,192 +871,86 @@ fn get_cached_files() -> Result<Vec<(PathBuf, FFProbeOutput)>> {
     Ok(files)
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+fn should_include_row(fields: &[String], filters: &[String]) -> bool {
+    // If no filters, include all rows
+    if filters.is_empty() {
+        return true;
+    }
 
-    let files = if args.cached {
-        // Get files from cache
-        let cached_files = get_cached_files()?;
-        if cached_files.is_empty() {
-            eprintln!("No cached entries found!");
-            return Ok(());
-        }
-        cached_files
-    } else {
-        // Collect all media files
-        let media_files = collect_media_files(args.paths);
-        if media_files.is_empty() {
-            eprintln!("No media files found!");
-            return Ok(());
-        }
-
-        let process_start = Instant::now();
-        let total_files = media_files.len();
-        let mut processed = 0;
-        let mut cached = 0;
-        let mut processed_files = Vec::new();
-
-        // Process each file
-        for file in media_files {
-            let is_cached = get_cached_probe(&file).ok().flatten().is_some();
-            if is_cached {
-                cached += 1;
-            }
-            match process_file(&file, args.filename_length) {
-                Ok(probe) => {
-                    processed += 1;
-                    eprint!(
-                        "\x1B[2K\rProcessing: {}/{} files ({} from cache) ({})",
-                        processed,
-                        total_files,
-                        cached,
-                        format_elapsed(process_start.elapsed().as_secs_f64())
-                    );
-                    processed_files.push((file, probe));
+    // Row must match all filters (AND logic)
+    filters.iter().all(|filter| {
+        // First try to split by '<' or '>'
+        if let Some((column, value)) = filter.split_once('<') {
+            return match column {
+                "bitrate" => {
+                    let field_bitrate = parse_bitrate(&fields[4]).unwrap_or(0.0);
+                    let threshold = value.parse::<f64>().unwrap_or(0.0);
+                    field_bitrate <= threshold
                 }
-                Err(e) => {
-                    processed += 1;
-                    eprint!(
-                        "\x1B[2K\rProcessing: {}/{} files ({} from cache) ({})",
-                        processed,
-                        total_files,
-                        cached,
-                        format_elapsed(process_start.elapsed().as_secs_f64())
-                    );
-                    eprintln!("\nError processing {}: {}", file.display(), e);
+                "duration" => {
+                    let field_duration = parse_duration_to_secs(&fields[2]);
+                    let threshold = parse_human_duration(value)
+                        .unwrap_or_else(|| value.parse::<f64>().unwrap_or(0.0));
+                    field_duration <= threshold
                 }
-            }
-        }
-        eprintln!();
-        processed_files
-    };
-
-    // Create rows for table
-    let mut rows: Vec<(Vec<String>, Row)> = Vec::new();
-    for (file, probe) in files {
-        let fields = format_probe_output(&file, &probe, args.filename_length)?;
-
-        // Apply filters if specified
-        if !args.filter.is_empty() {
-            if !should_include_row(&fields, &args.filter) {
-                continue;
-            }
-        }
-
-        let mut row_cells: Vec<Cell> = Vec::new();
-        for (i, field) in fields.iter().enumerate() {
-            let cell = match i {
-                1 => Cell::new(field).style_spec("r"), // Size
-                2 => Cell::new(field).style_spec("r"), // Duration
-                3 => Cell::new(field).style_spec("r"), // FPS
-                4 => Cell::new(field).style_spec("r"), // Bitrate
-                8 => Cell::new(field).style_spec("c"), // Depth
-                _ => Cell::new(field),                 // Others left-aligned
+                _ => true,
             };
-            row_cells.push(cell);
+        } else if let Some((column, value)) = filter.split_once('>') {
+            return match column {
+                "bitrate" => {
+                    let field_bitrate = parse_bitrate(&fields[4]).unwrap_or(0.0);
+                    let threshold = value.parse::<f64>().unwrap_or(0.0);
+                    field_bitrate >= threshold
+                }
+                "duration" => {
+                    let field_duration = parse_duration_to_secs(&fields[2]);
+                    let threshold = parse_human_duration(value)
+                        .unwrap_or_else(|| value.parse::<f64>().unwrap_or(0.0));
+                    field_duration >= threshold
+                }
+                _ => true,
+            };
         }
-        rows.push((fields, Row::new(row_cells)));
-    }
 
-    // Sort rows
-    let sort_index = match args.sort.as_str() {
-        "filename" => 0,
-        "size" => 1,
-        "duration" => 2,
-        "fps" => 3,
-        "bitrate" => 4,
-        "resolution" => 5,
-        "format" => 6,
-        "profile" => 7,
-        "depth" => 8,
-        "audio" => 9,
-        _ => 4, // default to bitrate
-    };
-
-    let ascending = args.direction == "asc";
-    rows.sort_by(|a, b| {
-        let cmp = match sort_index {
-            1 => {
-                // Size
-                let a_bytes = parse_size(&a.0[sort_index]);
-                let b_bytes = parse_size(&b.0[sort_index]);
-                a_bytes.cmp(&b_bytes)
-            }
-            2 => {
-                // Duration
-                let a_secs = a.0[sort_index].parse::<f64>().unwrap_or(0.0);
-                let b_secs = b.0[sort_index].parse::<f64>().unwrap_or(0.0);
-                a_secs
-                    .partial_cmp(&b_secs)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }
-            3 => {
-                // FPS
-                let a_fps = a.0[sort_index].parse::<f64>().unwrap_or(0.0);
-                let b_fps = b.0[sort_index].parse::<f64>().unwrap_or(0.0);
-                a_fps
-                    .partial_cmp(&b_fps)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }
-            4 => {
-                // Bitrate
-                let a_bitrate = parse_bitrate(&a.0[sort_index]).unwrap_or(0.0);
-                let b_bitrate = parse_bitrate(&b.0[sort_index]).unwrap_or(0.0);
-                a_bitrate
-                    .partial_cmp(&b_bitrate)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }
-            _ => a.0[sort_index].cmp(&b.0[sort_index]),
-        };
-        if ascending {
-            cmp
-        } else {
-            cmp.reverse()
+        // If no < or >, then use the equals format
+        let parts: Vec<&str> = filter.split('=').collect();
+        if parts.len() != 2 {
+            return true;
         }
-    });
 
-    // Create and print table
-    let mut table = Table::new();
-    let format = format::FormatBuilder::new()
-        .column_separator('│')
-        .borders('│')
-        .separator(
-            format::LinePosition::Top,
-            format::LineSeparator::new('─', '┬', '┌', '┐'),
-        )
-        .separator(
-            format::LinePosition::Bottom,
-            format::LineSeparator::new('─', '┴', '└', '┘'),
-        )
-        .separator(
-            format::LinePosition::Title,
-            format::LineSeparator::new('─', '┼', '├', '┤'),
-        )
-        .padding(1, 1)
-        .build();
-    table.set_format(format);
-
-    // Add header row
-    table.add_row(Row::new(vec![
-        Cell::new("Filename").with_style(Attr::Bold),
-        Cell::new("Size").with_style(Attr::Bold).style_spec("r"),
-        Cell::new("Duration").with_style(Attr::Bold).style_spec("r"),
-        Cell::new("FPS").with_style(Attr::Bold).style_spec("r"),
-        Cell::new("Bitrate").with_style(Attr::Bold).style_spec("r"),
-        Cell::new("Resolution").with_style(Attr::Bold),
-        Cell::new("Format").with_style(Attr::Bold),
-        Cell::new("Profile").with_style(Attr::Bold),
-        Cell::new("Depth").with_style(Attr::Bold).style_spec("c"),
-        Cell::new("Audio").with_style(Attr::Bold),
-    ]));
-
-    // Add sorted rows to table
-    for (_, row) in rows {
-        table.add_row(row);
-    }
-
-    // Print the table
-    table.printstd();
-
-    Ok(())
+        let (column, value) = (parts[0], parts[1]);
+        match column {
+            "filename" => {
+                let filename = &fields[0].to_lowercase();
+                let pattern = value.to_lowercase();
+                filename.contains(&pattern)
+            }
+            "size" => {
+                let field_size = parse_size(&fields[1]) as f64;
+                let threshold = parse_size(value) as f64;
+                field_size >= threshold
+            }
+            "duration" => {
+                let field_duration = parse_duration_to_secs(&fields[2]);
+                let threshold = parse_human_duration(value)
+                    .unwrap_or_else(|| value.parse::<f64>().unwrap_or(0.0));
+                field_duration >= threshold
+            }
+            "fps" => {
+                let field_fps = fields[3].parse::<f64>().unwrap_or(0.0);
+                let threshold = value.parse::<f64>().unwrap_or(0.0);
+                field_fps >= threshold
+            }
+            "bitrate" => {
+                let field_bitrate = parse_bitrate(&fields[4]).unwrap_or(0.0);
+                let threshold = value.parse::<f64>().unwrap_or(0.0);
+                field_bitrate <= threshold // Note: for bitrate, we usually want files UNDER a threshold
+            }
+            "resolution" => {
+                let field_res = &fields[5];
+                field_res == value
+            }
+            _ => true,
+        }
+    })
 }

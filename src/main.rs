@@ -3,13 +3,16 @@ use base64;
 use clap::Parser;
 use colored::Colorize;
 use dirs;
+use once_cell::sync::Lazy;
 use prettytable::{format, Attr, Cell, Row, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::SystemTime;
 use twox_hash::XxHash64;
 
@@ -58,6 +61,13 @@ struct CacheEntry {
     probe_data: FFProbeOutput,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct Cache {
+    entries: HashMap<String, CacheEntry>,
+}
+
+static CACHE: Lazy<Mutex<Option<Cache>>> = Lazy::new(|| Mutex::new(None));
+
 fn get_file_signature(path: &PathBuf) -> Result<String> {
     let metadata = fs::metadata(path)?;
     let size = metadata.len();
@@ -81,51 +91,77 @@ fn get_path_hash(path: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn get_cached_probe(file: &PathBuf) -> Result<Option<FFProbeOutput>> {
+fn load_cache() -> Result<Cache> {
+    let cache_path = get_cache_file()?;
+    if cache_path.exists() {
+        let content = fs::read_to_string(&cache_path)?;
+        Ok(serde_json::from_str(&content).unwrap_or(Cache {
+            entries: HashMap::new(),
+        }))
+    } else {
+        Ok(Cache {
+            entries: HashMap::new(),
+        })
+    }
+}
+
+fn save_cache(cache: &Cache) -> Result<()> {
+    let cache_path = get_cache_file()?;
+    let content = serde_json::to_string_pretty(cache)?;
+    fs::write(cache_path, content)?;
+    Ok(())
+}
+
+fn get_cache_file() -> Result<PathBuf> {
     let cache_dir = get_cache_dir()?;
-    let file_path = file.canonicalize()?;
-    let path_str = file_path
+    Ok(cache_dir.join("cache.json"))
+}
+
+fn get_cached_probe(file: &PathBuf) -> Result<Option<FFProbeOutput>> {
+    let canonical_path = file.canonicalize()?;
+    let path_str = canonical_path
         .to_str()
         .ok_or_else(|| anyhow!("Invalid file path"))?;
-    let mut hasher = DefaultHasher::new();
-    path_str.hash(&mut hasher);
-    let hash = hasher.finish();
-    let cache_file = cache_dir.join(format!("{:x}.json", hash));
 
-    if !cache_file.exists() {
-        return Ok(None);
+    let mut cache_guard = CACHE.lock().unwrap();
+    if cache_guard.is_none() {
+        *cache_guard = Some(load_cache()?);
     }
 
-    let cache_content = fs::read_to_string(&cache_file)?;
-    let cache_entry: CacheEntry = serde_json::from_str(&cache_content)?;
-
-    // Check if the file has changed
-    let current_signature = get_file_signature(file)?;
-    if current_signature != cache_entry.signature {
-        return Ok(None);
+    if let Some(cache) = &*cache_guard {
+        if let Some(entry) = cache.entries.get(path_str) {
+            let current_signature = get_file_signature(file)?;
+            if current_signature == entry.signature {
+                return Ok(Some(entry.probe_data.clone()));
+            }
+        }
     }
 
-    Ok(Some(cache_entry.probe_data))
+    Ok(None)
 }
 
 fn save_to_cache(file: &PathBuf, probe_data: &FFProbeOutput) -> Result<()> {
-    let cache_dir = get_cache_dir()?;
-    let file_path = file.canonicalize()?;
-    let path_str = file_path
+    let canonical_path = file.canonicalize()?;
+    let path_str = canonical_path
         .to_str()
         .ok_or_else(|| anyhow!("Invalid file path"))?;
-    let mut hasher = DefaultHasher::new();
-    path_str.hash(&mut hasher);
-    let hash = hasher.finish();
-    let cache_file = cache_dir.join(format!("{:x}.json", hash));
 
-    let cache_entry = CacheEntry {
-        signature: get_file_signature(file)?,
-        probe_data: probe_data.clone(),
-    };
+    let mut cache_guard = CACHE.lock().unwrap();
+    if cache_guard.is_none() {
+        *cache_guard = Some(load_cache()?);
+    }
 
-    let cache_content = serde_json::to_string(&cache_entry)?;
-    fs::write(cache_file, cache_content)?;
+    if let Some(cache) = &mut *cache_guard {
+        cache.entries.insert(
+            path_str.to_string(),
+            CacheEntry {
+                signature: get_file_signature(file)?,
+                probe_data: probe_data.clone(),
+            },
+        );
+        save_cache(cache)?;
+    }
+
     Ok(())
 }
 
@@ -213,16 +249,37 @@ fn process_file(file: &PathBuf) -> Result<Vec<String>> {
     format_probe_output(file, &probe)
 }
 
+fn truncate_middle(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        return s.to_string();
+    }
+
+    let ellipsis = "...";
+    let side_len = (max_len - ellipsis.len()) / 2;
+
+    let left: String = s.chars().take(side_len).collect();
+    let right: String = s
+        .chars()
+        .rev()
+        .take(side_len)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+
+    format!("{}{}{}", left, ellipsis, right)
+}
+
 fn format_probe_output(file: &PathBuf, probe: &FFProbeOutput) -> Result<Vec<String>> {
     let mut fields = Vec::new();
 
     // Get filename
-    fields.push(
+    fields.push(truncate_middle(
         file.file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("Unknown")
-            .to_string(),
-    );
+            .unwrap_or("Unknown"),
+        75,
+    ));
 
     // Get file size
     fields.push(format_size(&probe.format.size));

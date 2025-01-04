@@ -12,6 +12,10 @@ struct Args {
     /// Media files to analyze
     #[arg(required = true)]
     files: Vec<PathBuf>,
+
+    /// Sort by column (filename, size, duration, fps, bitrate, resolution, format, profile, depth, audio)
+    #[arg(short, long, value_parser = ["filename", "size", "duration", "fps", "bitrate", "resolution", "format", "profile", "depth", "audio"])]
+    sort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +249,7 @@ fn main() -> Result<()> {
     ]));
 
     // Process each file
+    let mut rows: Vec<(Vec<String>, Row)> = Vec::new();
     for file in args.files {
         match process_file(&file) {
             Ok(fields) => {
@@ -263,14 +268,89 @@ fn main() -> Result<()> {
                     row_cells.push(cell);
                 }
 
-                table.add_row(Row::new(row_cells));
+                rows.push((fields, Row::new(row_cells)));
             }
             Err(e) => eprintln!("Error processing {}: {}", file.display(), e),
         }
+    }
+
+    // Sort rows if requested
+    if let Some(sort_by) = args.sort {
+        let sort_index = match sort_by.as_str() {
+            "filename" => 0,
+            "size" => 1,
+            "duration" => 2,
+            "fps" => 3,
+            "bitrate" => 4,
+            "resolution" => 5,
+            "format" => 6,
+            "profile" => 7,
+            "depth" => 8,
+            "audio" => 9,
+            _ => 0,
+        };
+
+        rows.sort_by(|a, b| {
+            let a_val = &a.0[sort_index];
+            let b_val = &b.0[sort_index];
+
+            match sort_index {
+                1 => {
+                    // Size
+                    let a_bytes = parse_size(a_val);
+                    let b_bytes = parse_size(b_val);
+                    a_bytes.cmp(&b_bytes)
+                }
+                2 => {
+                    // Duration
+                    let a_secs = a_val.parse::<f64>().unwrap_or(0.0);
+                    let b_secs = b_val.parse::<f64>().unwrap_or(0.0);
+                    a_secs
+                        .partial_cmp(&b_secs)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }
+                3 => {
+                    // FPS
+                    let a_fps = a_val.parse::<f64>().unwrap_or(0.0);
+                    let b_fps = b_val.parse::<f64>().unwrap_or(0.0);
+                    a_fps
+                        .partial_cmp(&b_fps)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }
+                4 => {
+                    // Bitrate
+                    let a_bitrate = parse_bitrate(a_val);
+                    let b_bitrate = parse_bitrate(b_val);
+                    a_bitrate.cmp(&b_bitrate)
+                }
+                _ => a_val.cmp(b_val),
+            }
+        });
+    }
+
+    // Add sorted rows to table
+    for (_, row) in rows {
+        table.add_row(row);
     }
 
     // Print the table
     table.printstd();
 
     Ok(())
+}
+
+fn parse_size(size_str: &str) -> u64 {
+    let parts: Vec<&str> = size_str.split_whitespace().collect();
+    if parts.len() != 2 {
+        return 0;
+    }
+
+    let value: f64 = parts[0].parse().unwrap_or(0.0);
+    match parts[1] {
+        "GB" => (value * 1024.0 * 1024.0 * 1024.0) as u64,
+        "MB" => (value * 1024.0 * 1024.0) as u64,
+        "KB" => (value * 1024.0) as u64,
+        "B" => value as u64,
+        _ => 0,
+    }
 }

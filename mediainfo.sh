@@ -2,6 +2,10 @@
 
 set MEDIAINFO_BIN = "/usr/bin/mediainfo"
 
+# ANSI color codes
+set GREEN = "\033[32m"
+set RESET = "\033[0m"
+
 # Check if mediainfo is installed
 if (! -x "$MEDIAINFO_BIN") then
     echo "Error: mediainfo is not installed or not found at $MEDIAINFO_BIN"
@@ -19,11 +23,12 @@ endif
 # Get the directory of the script
 set SCRIPT_DIR = "$0:h"
 
-# Create a temporary file for storing results
+# Create temporary files
 set tmpfile = `mktemp`
+set formatted = `mktemp`
 
 # Print header
-echo "Filename | Size | Duration | FPS | Bitrate | Resolution | Format | Profile | Depth | Audio" > $tmpfile
+printf "%-30s | %-10s | %-10s | %-6s | %-15s | %-15s | %-10s | %-10s | %-6s | %-10s\n" "Filename" "Size" "Duration" "FPS" "Bitrate" "Resolution" "Format" "Profile" "Depth" "Audio" > $tmpfile
 
 # Process each file
 while ($#argv > 0)
@@ -35,13 +40,29 @@ while ($#argv > 0)
         continue
     endif
     
-    # Run mediainfo with the template and append to temp file
-    "$MEDIAINFO_BIN" "--Inform=file://$SCRIPT_DIR/mediainfo.tmpl" "$mediafile" >> $tmpfile
+    # Get mediainfo output
+    set line = `"$MEDIAINFO_BIN" "--Inform=file://$SCRIPT_DIR/mediainfo.tmpl" "$mediafile"`
+    
+    # Get bitrate (5th field)
+    set bitrate = `echo "$line" | cut -d'|' -f5 | sed 's/[^0-9]//g'`
+    
+    if ("$bitrate" != "" && "$bitrate" =~ [0-9]*) then
+        if ($bitrate > 5000) then
+            # Add color to bitrate field
+            set colored = `echo "$line" | awk -F'|' -v green="$GREEN" -v reset="$RESET" '{OFS="|"; $5=green$5reset; print}'`
+            echo "$colored" >> $tmpfile
+        else
+            echo "$line" >> $tmpfile
+        endif
+    else
+        echo "$line" >> $tmpfile
+    endif
+    
     shift
 end
 
-# Format the output as a table
-column -t -s '|' $tmpfile
+# Display formatted output
+cat $tmpfile | column -t -s '|' -o ' | '
 
 # Clean up
-rm -f $tmpfile
+rm -f $tmpfile $formatted

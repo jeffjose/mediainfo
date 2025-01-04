@@ -10,18 +10,19 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::SystemTime;
 use twox_hash::XxHash64;
+use walkdir::WalkDir;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Media files to analyze
+    /// Media files or directories to analyze
     #[arg(required = true)]
-    files: Vec<PathBuf>,
+    paths: Vec<PathBuf>,
 
     /// Sort by column (filename, size, duration, fps, bitrate, resolution, format, profile, depth, audio)
     #[arg(short, long, value_parser = ["filename", "size", "duration", "fps", "bitrate", "resolution", "format", "profile", "depth", "audio"])]
@@ -367,8 +368,50 @@ fn parse_bitrate(bitrate_str: &str) -> Option<u32> {
         .map(|b| (b * 1000.0) as u32) // Convert Mbps to Kbps
 }
 
+fn is_media_file(path: &Path) -> bool {
+    let media_extensions = [
+        "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "m2v", "m4v",
+        "3gp", "3g2", "mxf", "ts", "mts", "m2ts", "vob", "ogv", "qt", "rm", "rmvb", "asf", "mp3",
+        "wav", "flac", "m4a", "aac", "ogg", "wma", "opus",
+    ];
+
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| media_extensions.contains(&ext.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn collect_media_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut media_files = Vec::new();
+
+    for path in paths {
+        if path.is_file() {
+            if is_media_file(&path) {
+                media_files.push(path);
+            }
+        } else if path.is_dir() {
+            for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+                let path = entry.path().to_path_buf();
+                if path.is_file() && is_media_file(&path) {
+                    media_files.push(path);
+                }
+            }
+        }
+    }
+
+    media_files
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Collect all media files
+    let files = collect_media_files(args.paths);
+
+    if files.is_empty() {
+        eprintln!("No media files found!");
+        return Ok(());
+    }
 
     // Create the table
     let mut table = Table::new();
@@ -407,7 +450,7 @@ fn main() -> Result<()> {
 
     // Process each file
     let mut rows: Vec<(Vec<String>, Row)> = Vec::new();
-    for file in args.files {
+    for file in files {
         match process_file(&file) {
             Ok(fields) => {
                 let mut row_cells: Vec<Cell> = Vec::new();

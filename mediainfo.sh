@@ -1,9 +1,12 @@
 #!/bin/tcsh
 
+set MEDIAINFO_BIN = "/usr/bin/mediainfo"
+
 # Check if mediainfo is installed
-which mediainfo > /dev/null
-if ($status != 0) then
-    echo "Error: mediainfo is not installed. Please install it first."
+if (! -x "$MEDIAINFO_BIN") then
+    echo "Error: mediainfo is not installed or not found at $MEDIAINFO_BIN"
+    echo "Please install mediainfo using your package manager"
+    echo "For example: sudo apt-get install mediainfo"
     exit 1
 endif
 
@@ -33,7 +36,7 @@ while ($#argv > 0)
     endif
     
     # Run mediainfo with the template and append to temp file
-    mediainfo "--Inform=file://$SCRIPT_DIR/mediainfo.tmpl" "$mediafile" >> $tmpfile
+    "$MEDIAINFO_BIN" "--Inform=file://$SCRIPT_DIR/mediainfo.tmpl" "$mediafile" >> $tmpfile
     shift
 end
 

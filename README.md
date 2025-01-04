@@ -121,4 +121,19 @@ mediainfo --cached
 -l, --length <LENGTH>        Maximum filename length [default: 65]
 -a, --alias <ALIAS>         Use a predefined alias from config file
     --cached                Show only cached entries
+    --no-cache             Skip cache and force ffprobe (but update cache with results)
 ```
+
+## Output Columns
+
+- **Filename**: Name of the media file (truncated with ... if too long)
+- **Size**: File size in human-readable format (GB, MB, KB)
+- **Duration**: Length in HH:MM:SS or MM:SS format
+- **FPS**: Frames per second for video files
+- **Bitrate**: Video bitrate in Mbps
+- **Resolution**: Video dimensions with aspect ratio (e.g., "3840x2160 (16:9)")
+- **Format**: Video codec (h264, hevc, etc.)
+- **Profile**: Codec profile (high, main, etc.)
+- **Depth**: Color depth (8bit, 10bit, 12bit)
+- **Color**: Color space and range (e.g., "bt709 limited")
+- **Audio**: Audio channels and bitrate (e.g., "2CH 192k")

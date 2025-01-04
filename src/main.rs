@@ -52,6 +52,10 @@ struct Args {
     #[arg(long)]
     cached: bool,
 
+    /// Skip cache and force ffprobe (but update cache with results)
+    #[arg(long)]
+    no_cache: bool,
+
     /// Use a predefined alias from config file
     #[arg(short = 'a', long)]
     alias: Option<String>,
@@ -71,9 +75,15 @@ struct Stream {
     width: Option<i32>,
     height: Option<i32>,
     r_frame_rate: Option<String>,
+    avg_frame_rate: Option<String>,
+    display_aspect_ratio: Option<String>,
     bit_rate: Option<String>,
     pix_fmt: Option<String>,
+    color_space: Option<String>,
+    color_range: Option<String>,
     channels: Option<i32>,
+    sample_rate: Option<String>,
+    tags: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -221,11 +231,11 @@ fn main() -> Result<()> {
 
         // Process each file
         for file in media_files {
-            let is_cached = get_cached_probe(&file).ok().flatten().is_some();
+            let is_cached = !args.no_cache && get_cached_probe(&file).ok().flatten().is_some();
             if is_cached {
                 cached += 1;
             }
-            match process_file(&file, args.filename_length) {
+            match process_file(&file, args.filename_length, args.no_cache) {
                 Ok(probe) => {
                     processed += 1;
                     eprint!(
@@ -370,6 +380,7 @@ fn main() -> Result<()> {
         Cell::new("Format").with_style(Attr::Bold),
         Cell::new("Profile").with_style(Attr::Bold),
         Cell::new("Depth").with_style(Attr::Bold).style_spec("c"),
+        Cell::new("Color").with_style(Attr::Bold),
         Cell::new("Audio").with_style(Attr::Bold),
     ]));
 
@@ -667,13 +678,15 @@ fn parse_human_duration(duration_str: &str) -> Option<f64> {
     Some(total_seconds)
 }
 
-fn process_file(file: &PathBuf, filename_length: usize) -> Result<FFProbeOutput> {
-    // Try to get from cache first
-    if let Ok(Some(probe)) = get_cached_probe(file) {
-        return Ok(probe);
+fn process_file(file: &PathBuf, filename_length: usize, skip_cache: bool) -> Result<FFProbeOutput> {
+    // Try to get from cache first, unless skip_cache is true
+    if !skip_cache {
+        if let Ok(Some(probe)) = get_cached_probe(file) {
+            return Ok(probe);
+        }
     }
 
-    // If not in cache or cache is invalid, run ffprobe
+    // If not in cache, cache is invalid, or skip_cache is true, run ffprobe
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -695,7 +708,7 @@ fn process_file(file: &PathBuf, filename_length: usize) -> Result<FFProbeOutput>
 
     let probe: FFProbeOutput = serde_json::from_slice(&output.stdout)?;
 
-    // Save to cache immediately
+    // Always save to cache, even if we skipped reading from it
     save_to_cache(file, &probe)?;
 
     Ok(probe)
@@ -781,7 +794,13 @@ fn format_probe_output(
         // Get resolution
         let width = video.width.unwrap_or(0);
         let height = video.height.unwrap_or(0);
-        fields.push(format!("{}x{}", width, height));
+        let aspect = video.display_aspect_ratio.as_deref().unwrap_or("");
+        let resolution = if aspect.is_empty() {
+            format!("{}x{}", width, height)
+        } else {
+            format!("{}x{} ({})", width, height, aspect)
+        };
+        fields.push(resolution);
 
         // Get codec name
         fields.push(video.codec_name.clone().unwrap_or_default());
@@ -791,9 +810,18 @@ fn format_probe_output(
 
         // Get bit depth
         fields.push(get_bit_depth(video.pix_fmt.as_deref()));
+
+        // Get color info
+        let color_info = match (video.color_space.as_deref(), video.color_range.as_deref()) {
+            (Some(space), Some(range)) => format!("{} {}", space, range),
+            (Some(space), None) => space.to_string(),
+            (None, Some(range)) => range.to_string(),
+            (None, None) => String::new(),
+        };
+        fields.push(color_info);
     } else {
         // No video stream found, add empty fields
-        fields.extend(vec!["".to_string(); 6]);
+        fields.extend(vec!["".to_string(); 7]);
     }
 
     // Find audio stream

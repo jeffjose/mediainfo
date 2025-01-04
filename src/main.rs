@@ -366,14 +366,11 @@ fn format_probe_output(file: &PathBuf, probe: &FFProbeOutput) -> Result<Vec<Stri
     Ok(fields)
 }
 
-fn parse_bitrate(bitrate_str: &str) -> Option<u32> {
+fn parse_bitrate(bitrate_str: &str) -> Option<f64> {
     bitrate_str
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '.')
-        .collect::<String>()
-        .parse::<f32>()
-        .ok()
-        .map(|b| (b * 1000.0) as u32) // Convert Mbps to Kbps
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<f64>().ok())
 }
 
 fn is_media_file(path: &Path) -> bool {
@@ -448,7 +445,7 @@ fn should_include_row(fields: &[String], filter: &str) -> bool {
             "size" => parse_size(&fields[idx]) as f64,
             "duration" => parse_duration_to_secs(&fields[idx]),
             "fps" => fields[idx].parse::<f64>().unwrap_or(0.0),
-            "bitrate" => parse_bitrate(&fields[idx]).unwrap_or(0) as f64,
+            "bitrate" => parse_bitrate(&fields[idx]).unwrap_or(0.0),
             _ => return true,
         };
 
@@ -584,9 +581,11 @@ fn main() -> Result<()> {
             }
             4 => {
                 // Bitrate
-                let a_bitrate = parse_bitrate(&a.0[sort_index]).unwrap_or(0);
-                let b_bitrate = parse_bitrate(&b.0[sort_index]).unwrap_or(0);
-                a_bitrate.cmp(&b_bitrate)
+                let a_bitrate = parse_bitrate(&a.0[sort_index]).unwrap_or(0.0);
+                let b_bitrate = parse_bitrate(&b.0[sort_index]).unwrap_or(0.0);
+                a_bitrate
+                    .partial_cmp(&b_bitrate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             }
             _ => a.0[sort_index].cmp(&b.0[sort_index]),
         };

@@ -10,6 +10,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -21,7 +22,7 @@ use walkdir::WalkDir;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Media files or directories to analyze
-    #[arg(required = true)]
+    #[arg(required_unless_present = "cached")]
     paths: Vec<PathBuf>,
 
     /// Sort by column (filename, size, duration, fps, bitrate, resolution, format, profile, depth, audio)
@@ -34,11 +35,15 @@ struct Args {
 
     /// Filter results (format: column:operator:value, e.g., 'bitrate:>:5' for bitrate > 5 Mbps)
     #[arg(short, long)]
-    filter: Option<String>,
+    filter: Vec<String>,
 
     /// Maximum length for filenames (default: 65)
     #[arg(short = 'l', long, default_value = "65")]
     filename_length: usize,
+
+    /// Show only cached entries
+    #[arg(long)]
+    cached: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -106,12 +111,18 @@ fn get_path_hash(path: &str) -> String {
 
 fn load_cache() -> Result<Cache> {
     let cache_path = get_cache_file()?;
+    eprintln!("Reading cache from: {}", cache_path.display());
     if cache_path.exists() {
         let content = fs::read_to_string(&cache_path)?;
-        Ok(serde_json::from_str(&content).unwrap_or(Cache {
-            entries: HashMap::new(),
+        eprintln!("Cache file size: {} bytes", content.len());
+        Ok(serde_json::from_str(&content).unwrap_or_else(|e| {
+            eprintln!("Error parsing cache: {}", e);
+            Cache {
+                entries: HashMap::new(),
+            }
         }))
     } else {
+        eprintln!("Cache file does not exist");
         Ok(Cache {
             entries: HashMap::new(),
         })
@@ -136,9 +147,21 @@ fn get_cached_probe(file: &PathBuf) -> Result<Option<FFProbeOutput>> {
         .to_str()
         .ok_or_else(|| anyhow!("Invalid file path"))?;
 
+    // Only load cache if it hasn't been loaded yet
     let mut cache_guard = CACHE.lock().unwrap();
     if cache_guard.is_none() {
-        *cache_guard = Some(load_cache()?);
+        // Load cache silently without progress indicators
+        let cache_path = get_cache_file()?;
+        if cache_path.exists() {
+            let content = fs::read_to_string(&cache_path)?;
+            *cache_guard = Some(serde_json::from_str(&content).unwrap_or_else(|_| Cache {
+                entries: HashMap::new(),
+            }));
+        } else {
+            *cache_guard = Some(Cache {
+                entries: HashMap::new(),
+            });
+        }
     }
 
     if let Some(cache) = &*cache_guard {
@@ -305,45 +328,113 @@ fn parse_duration_to_secs(duration: &str) -> f64 {
     }
 }
 
-fn should_include_row(fields: &[String], filter: &str) -> bool {
-    let parts: Vec<&str> = filter.split(':').collect();
-    if parts.len() != 3 {
+fn parse_human_duration(duration_str: &str) -> Option<f64> {
+    let mut total_seconds = 0.0;
+    let mut current_number = String::new();
+    let mut chars = duration_str.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c.is_digit(10) {
+            current_number.push(c);
+        } else {
+            let number = current_number.parse::<f64>().ok()?;
+            current_number.clear();
+
+            match c {
+                'h' => total_seconds += number * 3600.0,
+                'm' => {
+                    if chars.peek() == Some(&'i') {
+                        chars.next(); // consume 'i'
+                        if chars.peek() == Some(&'n') {
+                            chars.next(); // consume 'n'
+                            total_seconds += number * 60.0;
+                        }
+                    } else {
+                        total_seconds += number * 60.0;
+                    }
+                }
+                's' => total_seconds += number,
+                _ => return None,
+            }
+        }
+    }
+
+    // Handle case where there might be a trailing number without unit (assume seconds)
+    if !current_number.is_empty() {
+        if let Ok(number) = current_number.parse::<f64>() {
+            total_seconds += number;
+        }
+    }
+
+    Some(total_seconds)
+}
+
+fn should_include_row(fields: &[String], filters: &[String]) -> bool {
+    // If no filters, include all rows
+    if filters.is_empty() {
         return true;
     }
 
-    let (column, op, value) = (parts[0], parts[1], parts[2]);
-    let idx = match column {
-        "size" => Some(1),
-        "duration" => Some(2),
-        "fps" => Some(3),
-        "bitrate" => Some(4),
-        _ => None,
-    };
+    // Row must match all filters (AND logic)
+    filters.iter().all(|filter| {
+        let parts: Vec<&str> = filter.split(':').collect();
+        if parts.len() != 2 {
+            return true;
+        }
 
-    if let Some(idx) = idx {
-        let field_value = match column {
-            "size" => parse_size(&fields[idx]) as f64,
-            "duration" => parse_duration_to_secs(&fields[idx]),
-            "fps" => fields[idx].parse::<f64>().unwrap_or(0.0),
-            "bitrate" => parse_bitrate(&fields[idx]).unwrap_or(0.0),
-            _ => return true,
+        let (column, value) = (parts[0], parts[1]);
+
+        // Special handling for filename matching with simplified syntax
+        if column == "filename" {
+            let filename = &fields[0].to_lowercase();
+            let pattern = value.to_lowercase();
+            return filename.contains(&pattern);
+        }
+
+        // For other columns, keep the existing operator-based syntax
+        if parts.len() != 3 {
+            return true;
+        }
+
+        let (column, op, value) = (parts[0], parts[1], parts[2]);
+        let idx = match column {
+            "size" => Some(1),
+            "duration" => Some(2),
+            "fps" => Some(3),
+            "bitrate" => Some(4),
+            _ => None,
         };
 
-        let threshold = value.parse::<f64>().unwrap_or(0.0);
-        match op {
-            ">" => field_value > threshold,
-            "<" => field_value < threshold,
-            _ => true,
+        if let Some(idx) = idx {
+            let field_value = match column {
+                "size" => parse_size(&fields[idx]) as f64,
+                "duration" => parse_duration_to_secs(&fields[idx]),
+                "fps" => fields[idx].parse::<f64>().unwrap_or(0.0),
+                "bitrate" => parse_bitrate(&fields[idx]).unwrap_or(0.0),
+                _ => return true,
+            };
+
+            let threshold = if column == "duration" {
+                parse_human_duration(value).unwrap_or_else(|| value.parse::<f64>().unwrap_or(0.0))
+            } else {
+                value.parse::<f64>().unwrap_or(0.0)
+            };
+
+            match op {
+                ">" => field_value > threshold,
+                "<" => field_value < threshold,
+                _ => true,
+            }
+        } else {
+            true
         }
-    } else {
-        true
-    }
+    })
 }
 
-fn process_file(file: &PathBuf, filename_length: usize) -> Result<Vec<String>> {
+fn process_file(file: &PathBuf, filename_length: usize) -> Result<FFProbeOutput> {
     // Try to get from cache first
     if let Ok(Some(probe)) = get_cached_probe(file) {
-        return format_probe_output(file, &probe, filename_length);
+        return Ok(probe);
     }
 
     // If not in cache or cache is invalid, run ffprobe
@@ -371,7 +462,7 @@ fn process_file(file: &PathBuf, filename_length: usize) -> Result<Vec<String>> {
     // Save to cache immediately
     save_to_cache(file, &probe)?;
 
-    format_probe_output(file, &probe, filename_length)
+    Ok(probe)
 }
 
 fn truncate_middle(s: &str, max_len: usize) -> String {
@@ -522,78 +613,114 @@ fn parse_size(size_str: &str) -> u64 {
     }
 }
 
+fn get_cached_files() -> Result<Vec<(PathBuf, FFProbeOutput)>> {
+    eprintln!("Loading cache file...");
+    let mut cache_guard = CACHE.lock().unwrap();
+    if cache_guard.is_none() {
+        eprintln!("Cache not loaded, loading from disk...");
+        *cache_guard = Some(load_cache()?);
+    }
+
+    let mut files = Vec::new();
+    if let Some(cache) = &*cache_guard {
+        eprintln!("Found {} entries in cache", cache.entries.len());
+        for (path_str, entry) in &cache.entries {
+            let path = PathBuf::from(path_str);
+            files.push((path, entry.probe_data.clone()));
+        }
+        eprintln!("Loaded {} entries", files.len());
+    } else {
+        eprintln!("No cache entries found");
+    }
+    Ok(files)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Collect all media files
-    let files = collect_media_files(args.paths);
+    let files = if args.cached {
+        // Get files from cache
+        let cached_files = get_cached_files()?;
+        if cached_files.is_empty() {
+            eprintln!("No cached entries found!");
+            return Ok(());
+        }
+        cached_files
+    } else {
+        // Collect all media files
+        let media_files = collect_media_files(args.paths);
+        if media_files.is_empty() {
+            eprintln!("No media files found!");
+            return Ok(());
+        }
 
-    if files.is_empty() {
-        eprintln!("No media files found!");
-        return Ok(());
-    }
+        let process_start = Instant::now();
+        let total_files = media_files.len();
+        let mut processed = 0;
+        let mut cached = 0;
+        let mut processed_files = Vec::new();
 
-    let process_start = Instant::now();
-    let total_files = files.len();
-    let mut processed = 0;
-    let mut cached = 0;
+        // Process each file
+        for file in media_files {
+            let is_cached = get_cached_probe(&file).ok().flatten().is_some();
+            if is_cached {
+                cached += 1;
+            }
+            match process_file(&file, args.filename_length) {
+                Ok(probe) => {
+                    processed += 1;
+                    eprint!(
+                        "\x1B[2K\rProcessing: {}/{} files ({} from cache) ({})",
+                        processed,
+                        total_files,
+                        cached,
+                        format_elapsed(process_start.elapsed().as_secs_f64())
+                    );
+                    processed_files.push((file, probe));
+                }
+                Err(e) => {
+                    processed += 1;
+                    eprint!(
+                        "\x1B[2K\rProcessing: {}/{} files ({} from cache) ({})",
+                        processed,
+                        total_files,
+                        cached,
+                        format_elapsed(process_start.elapsed().as_secs_f64())
+                    );
+                    eprintln!("\nError processing {}: {}", file.display(), e);
+                }
+            }
+        }
+        eprintln!();
+        processed_files
+    };
 
-    // Process each file
+    // Create rows for table
     let mut rows: Vec<(Vec<String>, Row)> = Vec::new();
-    for file in files.clone() {
-        let is_cached = get_cached_probe(&file).ok().flatten().is_some();
-        if is_cached {
-            cached += 1;
-        }
-        match process_file(&file, args.filename_length) {
-            Ok(fields) => {
-                processed += 1;
-                eprint!(
-                    "\x1B[2K\rProcessing: {}/{} files ({} from cache) ({})",
-                    processed,
-                    total_files,
-                    cached,
-                    format_elapsed(process_start.elapsed().as_secs_f64())
-                );
+    for (file, probe) in files {
+        let fields = format_probe_output(&file, &probe, args.filename_length)?;
 
-                // Apply filter if specified
-                if let Some(filter) = &args.filter {
-                    if !should_include_row(&fields, filter) {
-                        continue;
-                    }
-                }
-
-                let mut row_cells: Vec<Cell> = Vec::new();
-
-                // Add each field to the row
-                for (i, field) in fields.iter().enumerate() {
-                    let cell = match i {
-                        1 => Cell::new(field).style_spec("r"), // Size
-                        2 => Cell::new(field).style_spec("r"), // Duration
-                        3 => Cell::new(field).style_spec("r"), // FPS
-                        4 => Cell::new(field).style_spec("r"), // Bitrate
-                        8 => Cell::new(field).style_spec("c"), // Depth
-                        _ => Cell::new(field),                 // Others left-aligned
-                    };
-                    row_cells.push(cell);
-                }
-
-                rows.push((fields, Row::new(row_cells)));
-            }
-            Err(e) => {
-                processed += 1;
-                eprint!(
-                    "\x1B[2K\rProcessing: {}/{} files ({} from cache) ({})",
-                    processed,
-                    total_files,
-                    cached,
-                    format_elapsed(process_start.elapsed().as_secs_f64())
-                );
-                eprintln!("\nError processing {}: {}", file.display(), e);
+        // Apply filters if specified
+        if !args.filter.is_empty() {
+            if !should_include_row(&fields, &args.filter) {
+                continue;
             }
         }
+
+        let mut row_cells: Vec<Cell> = Vec::new();
+        for (i, field) in fields.iter().enumerate() {
+            let cell = match i {
+                1 => Cell::new(field).style_spec("r"), // Size
+                2 => Cell::new(field).style_spec("r"), // Duration
+                3 => Cell::new(field).style_spec("r"), // FPS
+                4 => Cell::new(field).style_spec("r"), // Bitrate
+                8 => Cell::new(field).style_spec("c"), // Depth
+                _ => Cell::new(field),                 // Others left-aligned
+            };
+            row_cells.push(cell);
+        }
+        rows.push((fields, Row::new(row_cells)));
     }
-    eprintln!(); // Move to next line after processing
 
     // Sort rows
     let sort_index = match args.sort.as_str() {

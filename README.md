@@ -52,13 +52,17 @@ mediainfo video.mp4 Movies/ Shows/
 Sorting:
 
 ```bash
-# Sort by file size
+# Default: Sort by bitrate (highest to lowest)
+mediainfo Videos/
+
+# Sort by file size (descending)
 mediainfo --sort size Videos/
 
-# Sort by duration
-mediainfo --sort duration Movies/
+# Sort by duration (ascending)
+mediainfo --sort duration --direction asc Movies/
 
-# Other sort options: filename, fps, bitrate, resolution, format, profile, depth, audio
+# Available sort columns: filename, size, duration, fps, bitrate, resolution, format, profile, depth, audio
+# Sort directions: asc (ascending), desc (descending)
 ```
 
 ## Output Columns

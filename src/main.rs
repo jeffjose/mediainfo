@@ -25,8 +25,12 @@ struct Args {
     paths: Vec<PathBuf>,
 
     /// Sort by column (filename, size, duration, fps, bitrate, resolution, format, profile, depth, audio)
-    #[arg(short, long, value_parser = ["filename", "size", "duration", "fps", "bitrate", "resolution", "format", "profile", "depth", "audio"])]
-    sort: Option<String>,
+    #[arg(short, long, default_value = "bitrate", value_parser = ["filename", "size", "duration", "fps", "bitrate", "resolution", "format", "profile", "depth", "audio"])]
+    sort: String,
+
+    /// Sort direction (asc, desc)
+    #[arg(short = 'd', long, default_value = "desc", value_parser = ["asc", "desc"])]
+    direction: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -474,59 +478,60 @@ fn main() -> Result<()> {
         }
     }
 
-    // Sort rows if requested
-    if let Some(sort_by) = args.sort {
-        let sort_index = match sort_by.as_str() {
-            "filename" => 0,
-            "size" => 1,
-            "duration" => 2,
-            "fps" => 3,
-            "bitrate" => 4,
-            "resolution" => 5,
-            "format" => 6,
-            "profile" => 7,
-            "depth" => 8,
-            "audio" => 9,
-            _ => 0,
-        };
+    // Sort rows
+    let sort_index = match args.sort.as_str() {
+        "filename" => 0,
+        "size" => 1,
+        "duration" => 2,
+        "fps" => 3,
+        "bitrate" => 4,
+        "resolution" => 5,
+        "format" => 6,
+        "profile" => 7,
+        "depth" => 8,
+        "audio" => 9,
+        _ => 4, // default to bitrate
+    };
 
-        rows.sort_by(|a, b| {
-            let a_val = &a.0[sort_index];
-            let b_val = &b.0[sort_index];
-
-            match sort_index {
-                1 => {
-                    // Size
-                    let a_bytes = parse_size(a_val);
-                    let b_bytes = parse_size(b_val);
-                    a_bytes.cmp(&b_bytes)
-                }
-                2 => {
-                    // Duration
-                    let a_secs = a_val.parse::<f64>().unwrap_or(0.0);
-                    let b_secs = b_val.parse::<f64>().unwrap_or(0.0);
-                    a_secs
-                        .partial_cmp(&b_secs)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                }
-                3 => {
-                    // FPS
-                    let a_fps = a_val.parse::<f64>().unwrap_or(0.0);
-                    let b_fps = b_val.parse::<f64>().unwrap_or(0.0);
-                    a_fps
-                        .partial_cmp(&b_fps)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                }
-                4 => {
-                    // Bitrate
-                    let a_bitrate = parse_bitrate(a_val);
-                    let b_bitrate = parse_bitrate(b_val);
-                    a_bitrate.cmp(&b_bitrate)
-                }
-                _ => a_val.cmp(b_val),
+    let ascending = args.direction == "asc";
+    rows.sort_by(|a, b| {
+        let cmp = match sort_index {
+            1 => {
+                // Size
+                let a_bytes = parse_size(&a.0[sort_index]);
+                let b_bytes = parse_size(&b.0[sort_index]);
+                a_bytes.cmp(&b_bytes)
             }
-        });
-    }
+            2 => {
+                // Duration
+                let a_secs = a.0[sort_index].parse::<f64>().unwrap_or(0.0);
+                let b_secs = b.0[sort_index].parse::<f64>().unwrap_or(0.0);
+                a_secs
+                    .partial_cmp(&b_secs)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+            3 => {
+                // FPS
+                let a_fps = a.0[sort_index].parse::<f64>().unwrap_or(0.0);
+                let b_fps = b.0[sort_index].parse::<f64>().unwrap_or(0.0);
+                a_fps
+                    .partial_cmp(&b_fps)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+            4 => {
+                // Bitrate
+                let a_bitrate = parse_bitrate(&a.0[sort_index]).unwrap_or(0);
+                let b_bitrate = parse_bitrate(&b.0[sort_index]).unwrap_or(0);
+                a_bitrate.cmp(&b_bitrate)
+            }
+            _ => a.0[sort_index].cmp(&b.0[sort_index]),
+        };
+        if ascending {
+            cmp
+        } else {
+            cmp.reverse()
+        }
+    });
 
     // Add sorted rows to table
     for (_, row) in rows {

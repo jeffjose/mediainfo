@@ -1,10 +1,17 @@
 use anyhow::{anyhow, Result};
+use base64;
 use clap::Parser;
 use colored::Colorize;
+use dirs;
 use prettytable::{format, Attr, Cell, Row, Table};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::SystemTime;
+use twox_hash::XxHash64;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -18,13 +25,13 @@ struct Args {
     sort: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct FFProbeOutput {
     streams: Vec<Stream>,
     format: Format,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct Stream {
     codec_type: String,
     codec_name: Option<String>,
@@ -37,12 +44,89 @@ struct Stream {
     channels: Option<i32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct Format {
     filename: String,
     size: String,
     duration: String,
     bit_rate: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CacheEntry {
+    signature: String,
+    probe_data: FFProbeOutput,
+}
+
+fn get_file_signature(path: &PathBuf) -> Result<String> {
+    let metadata = fs::metadata(path)?;
+    let size = metadata.len();
+    let modified = metadata
+        .modified()?
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs();
+    Ok(format!("{}-{}", size, modified))
+}
+
+fn get_cache_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
+    let cache_dir = home.join(".mediainfo").join("cache");
+    fs::create_dir_all(&cache_dir)?;
+    Ok(cache_dir)
+}
+
+fn get_path_hash(path: &str) -> String {
+    let mut hasher = XxHash64::default();
+    hasher.write(path.as_bytes());
+    format!("{:016x}", hasher.finish())
+}
+
+fn get_cached_probe(file: &PathBuf) -> Result<Option<FFProbeOutput>> {
+    let cache_dir = get_cache_dir()?;
+    let file_path = file.canonicalize()?;
+    let path_str = file_path
+        .to_str()
+        .ok_or_else(|| anyhow!("Invalid file path"))?;
+    let mut hasher = DefaultHasher::new();
+    path_str.hash(&mut hasher);
+    let hash = hasher.finish();
+    let cache_file = cache_dir.join(format!("{:x}.json", hash));
+
+    if !cache_file.exists() {
+        return Ok(None);
+    }
+
+    let cache_content = fs::read_to_string(&cache_file)?;
+    let cache_entry: CacheEntry = serde_json::from_str(&cache_content)?;
+
+    // Check if the file has changed
+    let current_signature = get_file_signature(file)?;
+    if current_signature != cache_entry.signature {
+        return Ok(None);
+    }
+
+    Ok(Some(cache_entry.probe_data))
+}
+
+fn save_to_cache(file: &PathBuf, probe_data: &FFProbeOutput) -> Result<()> {
+    let cache_dir = get_cache_dir()?;
+    let file_path = file.canonicalize()?;
+    let path_str = file_path
+        .to_str()
+        .ok_or_else(|| anyhow!("Invalid file path"))?;
+    let mut hasher = DefaultHasher::new();
+    path_str.hash(&mut hasher);
+    let hash = hasher.finish();
+    let cache_file = cache_dir.join(format!("{:x}.json", hash));
+
+    let cache_entry = CacheEntry {
+        signature: get_file_signature(file)?,
+        probe_data: probe_data.clone(),
+    };
+
+    let cache_content = serde_json::to_string(&cache_entry)?;
+    fs::write(cache_file, cache_content)?;
+    Ok(())
 }
 
 fn format_duration(duration: &str) -> String {
@@ -94,6 +178,12 @@ fn get_bit_depth(pix_fmt: Option<&str>) -> String {
 }
 
 fn process_file(file: &PathBuf) -> Result<Vec<String>> {
+    // Try to get from cache first
+    if let Ok(Some(probe)) = get_cached_probe(file) {
+        return format_probe_output(file, &probe);
+    }
+
+    // If not in cache or cache is invalid, run ffprobe
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -114,6 +204,16 @@ fn process_file(file: &PathBuf) -> Result<Vec<String>> {
     }
 
     let probe: FFProbeOutput = serde_json::from_slice(&output.stdout)?;
+
+    // Save to cache
+    if let Err(e) = save_to_cache(file, &probe) {
+        eprintln!("Warning: Failed to save to cache: {}", e);
+    }
+
+    format_probe_output(file, &probe)
+}
+
+fn format_probe_output(file: &PathBuf, probe: &FFProbeOutput) -> Result<Vec<String>> {
     let mut fields = Vec::new();
 
     // Get filename

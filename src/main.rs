@@ -13,7 +13,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use twox_hash::XxHash64;
 use walkdir::WalkDir;
 
@@ -35,6 +35,10 @@ struct Args {
     /// Filter results (format: column:operator:value, e.g., 'bitrate:>:5' for bitrate > 5 Mbps)
     #[arg(short, long)]
     filter: Option<String>,
+
+    /// Maximum length for filenames (default: 65)
+    #[arg(short = 'l', long, default_value = "65")]
+    filename_length: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -222,10 +226,124 @@ fn get_bit_depth(pix_fmt: Option<&str>) -> String {
     .to_string()
 }
 
-fn process_file(file: &PathBuf) -> Result<Vec<String>> {
+fn format_elapsed(secs: f64) -> String {
+    if secs >= 60.0 {
+        let minutes = (secs / 60.0).floor();
+        let seconds = secs % 60.0;
+        format!("{}:{:02}", minutes as u32, seconds as u32)
+    } else {
+        format!("{}s", secs.round() as u32)
+    }
+}
+
+fn collect_media_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let start_time = Instant::now();
+    let mut media_files = Vec::new();
+    let mut scanned = 0;
+    let mut found = 0;
+
+    // Clear line and show initial status
+    eprint!(
+        "\x1B[2K\rScanning: {} scanned, {} media files found ({})",
+        scanned,
+        found,
+        format_elapsed(start_time.elapsed().as_secs_f64())
+    );
+
+    for path in paths {
+        if path.is_file() {
+            scanned += 1;
+            if is_media_file(&path) {
+                found += 1;
+                eprint!(
+                    "\x1B[2K\rScanning: {} scanned, {} media files found ({})",
+                    scanned,
+                    found,
+                    format_elapsed(start_time.elapsed().as_secs_f64())
+                );
+                media_files.push(path);
+            }
+        } else if path.is_dir() {
+            for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+                let path = entry.path().to_path_buf();
+                if path.is_file() {
+                    scanned += 1;
+                    if is_media_file(&path) {
+                        found += 1;
+                        eprint!(
+                            "\x1B[2K\rScanning: {} scanned, {} media files found ({})",
+                            scanned,
+                            found,
+                            format_elapsed(start_time.elapsed().as_secs_f64())
+                        );
+                        media_files.push(path);
+                    }
+                }
+            }
+        }
+    }
+    let elapsed = start_time.elapsed().as_secs_f64();
+    eprintln!("\nScanning completed in {}", format_elapsed(elapsed));
+    media_files
+}
+
+fn parse_duration_to_secs(duration: &str) -> f64 {
+    let parts: Vec<&str> = duration.split(':').collect();
+    match parts.len() {
+        2 => {
+            let mins: f64 = parts[0].parse().unwrap_or(0.0);
+            let secs: f64 = parts[1].parse().unwrap_or(0.0);
+            mins * 60.0 + secs
+        }
+        3 => {
+            let hours: f64 = parts[0].parse().unwrap_or(0.0);
+            let mins: f64 = parts[1].parse().unwrap_or(0.0);
+            let secs: f64 = parts[2].parse().unwrap_or(0.0);
+            hours * 3600.0 + mins * 60.0 + secs
+        }
+        _ => 0.0,
+    }
+}
+
+fn should_include_row(fields: &[String], filter: &str) -> bool {
+    let parts: Vec<&str> = filter.split(':').collect();
+    if parts.len() != 3 {
+        return true;
+    }
+
+    let (column, op, value) = (parts[0], parts[1], parts[2]);
+    let idx = match column {
+        "size" => Some(1),
+        "duration" => Some(2),
+        "fps" => Some(3),
+        "bitrate" => Some(4),
+        _ => None,
+    };
+
+    if let Some(idx) = idx {
+        let field_value = match column {
+            "size" => parse_size(&fields[idx]) as f64,
+            "duration" => parse_duration_to_secs(&fields[idx]),
+            "fps" => fields[idx].parse::<f64>().unwrap_or(0.0),
+            "bitrate" => parse_bitrate(&fields[idx]).unwrap_or(0.0),
+            _ => return true,
+        };
+
+        let threshold = value.parse::<f64>().unwrap_or(0.0);
+        match op {
+            ">" => field_value > threshold,
+            "<" => field_value < threshold,
+            _ => true,
+        }
+    } else {
+        true
+    }
+}
+
+fn process_file(file: &PathBuf, filename_length: usize) -> Result<Vec<String>> {
     // Try to get from cache first
     if let Ok(Some(probe)) = get_cached_probe(file) {
-        return format_probe_output(file, &probe);
+        return format_probe_output(file, &probe, filename_length);
     }
 
     // If not in cache or cache is invalid, run ffprobe
@@ -250,12 +368,10 @@ fn process_file(file: &PathBuf) -> Result<Vec<String>> {
 
     let probe: FFProbeOutput = serde_json::from_slice(&output.stdout)?;
 
-    // Save to cache
-    if let Err(e) = save_to_cache(file, &probe) {
-        eprintln!("Warning: Failed to save to cache: {}", e);
-    }
+    // Save to cache immediately
+    save_to_cache(file, &probe)?;
 
-    format_probe_output(file, &probe)
+    format_probe_output(file, &probe, filename_length)
 }
 
 fn truncate_middle(s: &str, max_len: usize) -> String {
@@ -279,7 +395,11 @@ fn truncate_middle(s: &str, max_len: usize) -> String {
     format!("{}{}{}", left, ellipsis, right)
 }
 
-fn format_probe_output(file: &PathBuf, probe: &FFProbeOutput) -> Result<Vec<String>> {
+fn format_probe_output(
+    file: &PathBuf,
+    probe: &FFProbeOutput,
+    filename_length: usize,
+) -> Result<Vec<String>> {
     let mut fields = Vec::new();
 
     // Get filename
@@ -287,7 +407,7 @@ fn format_probe_output(file: &PathBuf, probe: &FFProbeOutput) -> Result<Vec<Stri
         file.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("Unknown"),
-        75,
+        filename_length,
     ));
 
     // Get file size
@@ -386,77 +506,19 @@ fn is_media_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn collect_media_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut media_files = Vec::new();
-
-    for path in paths {
-        if path.is_file() {
-            if is_media_file(&path) {
-                media_files.push(path);
-            }
-        } else if path.is_dir() {
-            for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
-                let path = entry.path().to_path_buf();
-                if path.is_file() && is_media_file(&path) {
-                    media_files.push(path);
-                }
-            }
-        }
+fn parse_size(size_str: &str) -> u64 {
+    let parts: Vec<&str> = size_str.split_whitespace().collect();
+    if parts.len() != 2 {
+        return 0;
     }
 
-    media_files
-}
-
-fn parse_duration_to_secs(duration: &str) -> f64 {
-    let parts: Vec<&str> = duration.split(':').collect();
-    match parts.len() {
-        2 => {
-            let mins: f64 = parts[0].parse().unwrap_or(0.0);
-            let secs: f64 = parts[1].parse().unwrap_or(0.0);
-            mins * 60.0 + secs
-        }
-        3 => {
-            let hours: f64 = parts[0].parse().unwrap_or(0.0);
-            let mins: f64 = parts[1].parse().unwrap_or(0.0);
-            let secs: f64 = parts[2].parse().unwrap_or(0.0);
-            hours * 3600.0 + mins * 60.0 + secs
-        }
-        _ => 0.0,
-    }
-}
-
-fn should_include_row(fields: &[String], filter: &str) -> bool {
-    let parts: Vec<&str> = filter.split(':').collect();
-    if parts.len() != 3 {
-        return true;
-    }
-
-    let (column, op, value) = (parts[0], parts[1], parts[2]);
-    let idx = match column {
-        "size" => Some(1),
-        "duration" => Some(2),
-        "fps" => Some(3),
-        "bitrate" => Some(4),
-        _ => None,
-    };
-
-    if let Some(idx) = idx {
-        let field_value = match column {
-            "size" => parse_size(&fields[idx]) as f64,
-            "duration" => parse_duration_to_secs(&fields[idx]),
-            "fps" => fields[idx].parse::<f64>().unwrap_or(0.0),
-            "bitrate" => parse_bitrate(&fields[idx]).unwrap_or(0.0),
-            _ => return true,
-        };
-
-        let threshold = value.parse::<f64>().unwrap_or(0.0);
-        match op {
-            ">" => field_value > threshold,
-            "<" => field_value < threshold,
-            _ => true,
-        }
-    } else {
-        true
+    let value: f64 = parts[0].parse().unwrap_or(0.0);
+    match parts[1] {
+        "GB" => (value * 1024.0 * 1024.0 * 1024.0) as u64,
+        "MB" => (value * 1024.0 * 1024.0) as u64,
+        "KB" => (value * 1024.0) as u64,
+        "B" => value as u64,
+        _ => 0,
     }
 }
 
@@ -471,46 +533,29 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Create the table
-    let mut table = Table::new();
-    let format = format::FormatBuilder::new()
-        .column_separator('│')
-        .borders('│')
-        .separator(
-            format::LinePosition::Top,
-            format::LineSeparator::new('─', '┬', '┌', '┐'),
-        )
-        .separator(
-            format::LinePosition::Bottom,
-            format::LineSeparator::new('─', '┴', '└', '┘'),
-        )
-        .separator(
-            format::LinePosition::Title,
-            format::LineSeparator::new('─', '┼', '├', '┤'),
-        )
-        .padding(1, 1)
-        .build();
-    table.set_format(format);
-
-    // Add header row
-    table.add_row(Row::new(vec![
-        Cell::new("Filename").with_style(Attr::Bold),
-        Cell::new("Size").with_style(Attr::Bold).style_spec("r"),
-        Cell::new("Duration").with_style(Attr::Bold).style_spec("r"),
-        Cell::new("FPS").with_style(Attr::Bold).style_spec("r"),
-        Cell::new("Bitrate").with_style(Attr::Bold).style_spec("r"),
-        Cell::new("Resolution").with_style(Attr::Bold),
-        Cell::new("Format").with_style(Attr::Bold),
-        Cell::new("Profile").with_style(Attr::Bold),
-        Cell::new("Depth").with_style(Attr::Bold).style_spec("c"),
-        Cell::new("Audio").with_style(Attr::Bold),
-    ]));
+    let process_start = Instant::now();
+    let total_files = files.len();
+    let mut processed = 0;
+    let mut cached = 0;
 
     // Process each file
     let mut rows: Vec<(Vec<String>, Row)> = Vec::new();
-    for file in files {
-        match process_file(&file) {
+    for file in files.clone() {
+        let is_cached = get_cached_probe(&file).ok().flatten().is_some();
+        if is_cached {
+            cached += 1;
+        }
+        match process_file(&file, args.filename_length) {
             Ok(fields) => {
+                processed += 1;
+                eprint!(
+                    "\x1B[2K\rProcessing: {}/{} files ({} from cache) ({})",
+                    processed,
+                    total_files,
+                    cached,
+                    format_elapsed(process_start.elapsed().as_secs_f64())
+                );
+
                 // Apply filter if specified
                 if let Some(filter) = &args.filter {
                     if !should_include_row(&fields, filter) {
@@ -535,9 +580,20 @@ fn main() -> Result<()> {
 
                 rows.push((fields, Row::new(row_cells)));
             }
-            Err(e) => eprintln!("Error processing {}: {}", file.display(), e),
+            Err(e) => {
+                processed += 1;
+                eprint!(
+                    "\x1B[2K\rProcessing: {}/{} files ({} from cache) ({})",
+                    processed,
+                    total_files,
+                    cached,
+                    format_elapsed(process_start.elapsed().as_secs_f64())
+                );
+                eprintln!("\nError processing {}: {}", file.display(), e);
+            }
         }
     }
+    eprintln!(); // Move to next line after processing
 
     // Sort rows
     let sort_index = match args.sort.as_str() {
@@ -596,6 +652,41 @@ fn main() -> Result<()> {
         }
     });
 
+    // Create and print table
+    let mut table = Table::new();
+    let format = format::FormatBuilder::new()
+        .column_separator('│')
+        .borders('│')
+        .separator(
+            format::LinePosition::Top,
+            format::LineSeparator::new('─', '┬', '┌', '┐'),
+        )
+        .separator(
+            format::LinePosition::Bottom,
+            format::LineSeparator::new('─', '┴', '└', '┘'),
+        )
+        .separator(
+            format::LinePosition::Title,
+            format::LineSeparator::new('─', '┼', '├', '┤'),
+        )
+        .padding(1, 1)
+        .build();
+    table.set_format(format);
+
+    // Add header row
+    table.add_row(Row::new(vec![
+        Cell::new("Filename").with_style(Attr::Bold),
+        Cell::new("Size").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("Duration").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("FPS").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("Bitrate").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("Resolution").with_style(Attr::Bold),
+        Cell::new("Format").with_style(Attr::Bold),
+        Cell::new("Profile").with_style(Attr::Bold),
+        Cell::new("Depth").with_style(Attr::Bold).style_spec("c"),
+        Cell::new("Audio").with_style(Attr::Bold),
+    ]));
+
     // Add sorted rows to table
     for (_, row) in rows {
         table.add_row(row);
@@ -605,20 +696,4 @@ fn main() -> Result<()> {
     table.printstd();
 
     Ok(())
-}
-
-fn parse_size(size_str: &str) -> u64 {
-    let parts: Vec<&str> = size_str.split_whitespace().collect();
-    if parts.len() != 2 {
-        return 0;
-    }
-
-    let value: f64 = parts[0].parse().unwrap_or(0.0);
-    match parts[1] {
-        "GB" => (value * 1024.0 * 1024.0 * 1024.0) as u64,
-        "MB" => (value * 1024.0 * 1024.0) as u64,
-        "KB" => (value * 1024.0) as u64,
-        "B" => value as u64,
-        _ => 0,
-    }
 }

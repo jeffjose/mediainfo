@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use colored::Colorize;
-use prettytable::{format, Cell, Row, Table};
+use prettytable::{format, Attr, Cell, Row, Table};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Command;
@@ -151,8 +151,9 @@ fn process_file(file: &PathBuf) -> Result<Vec<String>> {
             .unwrap_or_default();
         fields.push(fps);
 
-        // Get bitrate
-        let bitrate = video
+        // Get bitrate from format (more reliable than video stream bitrate)
+        let bitrate = probe
+            .format
             .bit_rate
             .as_deref()
             .and_then(|b| b.parse::<f64>().ok())
@@ -180,7 +181,14 @@ fn process_file(file: &PathBuf) -> Result<Vec<String>> {
 
     // Find audio stream
     if let Some(audio) = probe.streams.iter().find(|s| s.codec_type == "audio") {
-        fields.push(format!("{}CH", audio.channels.unwrap_or(0)));
+        let channels = format!("{}CH", audio.channels.unwrap_or(0));
+        let bitrate = audio
+            .bit_rate
+            .as_deref()
+            .and_then(|b| b.parse::<f64>().ok())
+            .map(|b| format!(" {:.0}k", b / 1000.0))
+            .unwrap_or_default();
+        fields.push(format!("{}{}", channels, bitrate));
     } else {
         fields.push("".to_string());
     }
@@ -224,16 +232,16 @@ fn main() -> Result<()> {
 
     // Add header row
     table.add_row(Row::new(vec![
-        Cell::new("Filename"),
-        Cell::new("Size"),
-        Cell::new("Duration"),
-        Cell::new("FPS"),
-        Cell::new("Bitrate"),
-        Cell::new("Resolution"),
-        Cell::new("Format"),
-        Cell::new("Profile"),
-        Cell::new("Depth"),
-        Cell::new("Audio"),
+        Cell::new("Filename").with_style(Attr::Bold),
+        Cell::new("Size").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("Duration").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("FPS").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("Bitrate").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("Resolution").with_style(Attr::Bold),
+        Cell::new("Format").with_style(Attr::Bold),
+        Cell::new("Profile").with_style(Attr::Bold),
+        Cell::new("Depth").with_style(Attr::Bold).style_spec("c"),
+        Cell::new("Audio").with_style(Attr::Bold),
     ]));
 
     // Process each file
@@ -244,21 +252,15 @@ fn main() -> Result<()> {
 
                 // Add each field to the row
                 for (i, field) in fields.iter().enumerate() {
-                    if i == 4 {
-                        // Bitrate field
-                        if let Some(bitrate) = parse_bitrate(field) {
-                            if bitrate > 5000 {
-                                row_cells.push(Cell::new(&field.green().to_string()));
-                                continue;
-                            }
-                        }
-                    }
-                    row_cells.push(Cell::new(field));
-                }
-
-                // Pad with empty cells if needed
-                while row_cells.len() < 10 {
-                    row_cells.push(Cell::new(""));
+                    let cell = match i {
+                        1 => Cell::new(field).style_spec("r"), // Size
+                        2 => Cell::new(field).style_spec("r"), // Duration
+                        3 => Cell::new(field).style_spec("r"), // FPS
+                        4 => Cell::new(field).style_spec("r"), // Bitrate
+                        8 => Cell::new(field).style_spec("c"), // Depth
+                        _ => Cell::new(field),                 // Others left-aligned
+                    };
+                    row_cells.push(cell);
                 }
 
                 table.add_row(Row::new(row_cells));

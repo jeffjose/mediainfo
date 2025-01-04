@@ -31,6 +31,10 @@ struct Args {
     /// Sort direction (asc, desc)
     #[arg(short = 'd', long, default_value = "desc", value_parser = ["asc", "desc"])]
     direction: String,
+
+    /// Filter results (format: column:operator:value, e.g., 'bitrate:>:5' for bitrate > 5 Mbps)
+    #[arg(short, long)]
+    filter: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -406,6 +410,59 @@ fn collect_media_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     media_files
 }
 
+fn parse_duration_to_secs(duration: &str) -> f64 {
+    let parts: Vec<&str> = duration.split(':').collect();
+    match parts.len() {
+        2 => {
+            let mins: f64 = parts[0].parse().unwrap_or(0.0);
+            let secs: f64 = parts[1].parse().unwrap_or(0.0);
+            mins * 60.0 + secs
+        }
+        3 => {
+            let hours: f64 = parts[0].parse().unwrap_or(0.0);
+            let mins: f64 = parts[1].parse().unwrap_or(0.0);
+            let secs: f64 = parts[2].parse().unwrap_or(0.0);
+            hours * 3600.0 + mins * 60.0 + secs
+        }
+        _ => 0.0,
+    }
+}
+
+fn should_include_row(fields: &[String], filter: &str) -> bool {
+    let parts: Vec<&str> = filter.split(':').collect();
+    if parts.len() != 3 {
+        return true;
+    }
+
+    let (column, op, value) = (parts[0], parts[1], parts[2]);
+    let idx = match column {
+        "size" => Some(1),
+        "duration" => Some(2),
+        "fps" => Some(3),
+        "bitrate" => Some(4),
+        _ => None,
+    };
+
+    if let Some(idx) = idx {
+        let field_value = match column {
+            "size" => parse_size(&fields[idx]) as f64,
+            "duration" => parse_duration_to_secs(&fields[idx]),
+            "fps" => fields[idx].parse::<f64>().unwrap_or(0.0),
+            "bitrate" => parse_bitrate(&fields[idx]).unwrap_or(0) as f64,
+            _ => return true,
+        };
+
+        let threshold = value.parse::<f64>().unwrap_or(0.0);
+        match op {
+            ">" => field_value > threshold,
+            "<" => field_value < threshold,
+            _ => true,
+        }
+    } else {
+        true
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -457,6 +514,13 @@ fn main() -> Result<()> {
     for file in files {
         match process_file(&file) {
             Ok(fields) => {
+                // Apply filter if specified
+                if let Some(filter) = &args.filter {
+                    if !should_include_row(&fields, filter) {
+                        continue;
+                    }
+                }
+
                 let mut row_cells: Vec<Cell> = Vec::new();
 
                 // Add each field to the row

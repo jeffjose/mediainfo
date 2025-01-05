@@ -271,7 +271,7 @@ fn main() -> Result<()> {
 
         // Apply filters if specified
         if !args.filter.is_empty() {
-            if !should_include_row(&fields, &args.filter) {
+            if !should_include_row(&fields, &args.filter)? {
                 continue;
             }
         }
@@ -899,55 +899,88 @@ fn get_cached_files() -> Result<Vec<(PathBuf, FFProbeOutput)>> {
     Ok(files)
 }
 
-fn should_include_row(fields: &[String], filters: &[String]) -> bool {
+fn should_include_row(fields: &[String], filters: &[String]) -> Result<bool> {
+    // Define valid column names
+    const VALID_COLUMNS: [&str; 7] = [
+        "filename",
+        "size",
+        "duration",
+        "fps",
+        "bitrate",
+        "resolution",
+        "audio",
+    ];
+
     // If no filters, include all rows
     if filters.is_empty() {
-        return true;
+        return Ok(true);
     }
 
     // Row must match all filters (AND logic)
-    filters.iter().all(|filter| {
+    for filter in filters {
         // First try to split by '<' or '>'
         if let Some((column, value)) = filter.split_once('<') {
-            return match column {
+            if !VALID_COLUMNS.contains(&column) {
+                return Err(anyhow!("Invalid column name in filter: {}", column));
+            }
+            match column {
                 "bitrate" => {
                     let field_bitrate = parse_bitrate(&fields[4]).unwrap_or(0.0);
                     let threshold = value.parse::<f64>().unwrap_or(0.0);
-                    field_bitrate <= threshold
+                    if field_bitrate > threshold {
+                        return Ok(false);
+                    }
                 }
                 "duration" => {
                     let field_duration = parse_duration_to_secs(&fields[2]);
                     let threshold = parse_human_duration(value)
                         .unwrap_or_else(|| value.parse::<f64>().unwrap_or(0.0));
-                    field_duration <= threshold
+                    if field_duration > threshold {
+                        return Ok(false);
+                    }
                 }
-                _ => true,
-            };
-        } else if let Some((column, value)) = filter.split_once('>') {
-            return match column {
+                _ => {}
+            }
+            continue;
+        }
+
+        if let Some((column, value)) = filter.split_once('>') {
+            if !VALID_COLUMNS.contains(&column) {
+                return Err(anyhow!("Invalid column name in filter: {}", column));
+            }
+            match column {
                 "bitrate" => {
                     let field_bitrate = parse_bitrate(&fields[4]).unwrap_or(0.0);
                     let threshold = value.parse::<f64>().unwrap_or(0.0);
-                    field_bitrate >= threshold
+                    if field_bitrate < threshold {
+                        return Ok(false);
+                    }
                 }
                 "duration" => {
                     let field_duration = parse_duration_to_secs(&fields[2]);
                     let threshold = parse_human_duration(value)
                         .unwrap_or_else(|| value.parse::<f64>().unwrap_or(0.0));
-                    field_duration >= threshold
+                    if field_duration < threshold {
+                        return Ok(false);
+                    }
                 }
-                _ => true,
-            };
+                _ => {}
+            }
+            continue;
         }
 
         // If no < or >, then use the equals format
         let parts: Vec<&str> = filter.split('=').collect();
         if parts.len() != 2 {
-            return true;
+            continue;
         }
 
         let (column, value) = (parts[0], parts[1]);
-        match column {
+        if !VALID_COLUMNS.contains(&column) {
+            return Err(anyhow!("Invalid column name in filter: {}", column));
+        }
+
+        let matches = match column {
             "filename" => {
                 let filename = &fields[0].to_lowercase();
                 let pattern = value.to_lowercase();
@@ -972,13 +1005,19 @@ fn should_include_row(fields: &[String], filters: &[String]) -> bool {
             "bitrate" => {
                 let field_bitrate = parse_bitrate(&fields[4]).unwrap_or(0.0);
                 let threshold = value.parse::<f64>().unwrap_or(0.0);
-                field_bitrate <= threshold // Note: for bitrate, we usually want files UNDER a threshold
+                field_bitrate <= threshold
             }
             "resolution" => {
                 let field_res = &fields[5];
                 field_res == value
             }
             _ => true,
+        };
+
+        if !matches {
+            return Ok(false);
         }
-    })
+    }
+
+    Ok(true)
 }

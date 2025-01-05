@@ -127,9 +127,9 @@ mediainfo --cached
 ## Output Columns
 
 - **Filename**: Name of the media file (truncated with ... if too long)
-- **Size**: File size in human-readable format (GB, MB, KB)
 - **Duration**: Length in HH:MM:SS or MM:SS format
 - **FPS**: Frames per second for video files
+- **Size**: File size in human-readable format (GB, MB, KB)
 - **Bitrate**: Video bitrate in Mbps
 - **Resolution**: Video dimensions with aspect ratio (e.g., "3840x2160 (16:9)")
 - **Format**: Video codec (h264, hevc, etc.)

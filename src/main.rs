@@ -294,9 +294,9 @@ fn main() -> Result<()> {
     // Sort rows
     let sort_index = match args.sort.as_str() {
         "filename" => 0,
-        "size" => 1,
-        "duration" => 2,
-        "fps" => 3,
+        "duration" => 1,
+        "fps" => 2,
+        "size" => 3,
         "bitrate" => 4,
         "resolution" => 5,
         "format" => 6,
@@ -310,12 +310,6 @@ fn main() -> Result<()> {
     rows.sort_by(|a, b| {
         let cmp = match sort_index {
             1 => {
-                // Size
-                let a_bytes = parse_size(&a.0[sort_index]);
-                let b_bytes = parse_size(&b.0[sort_index]);
-                a_bytes.cmp(&b_bytes)
-            }
-            2 => {
                 // Duration
                 let a_secs = parse_duration_to_secs(&a.0[sort_index]);
                 let b_secs = parse_duration_to_secs(&b.0[sort_index]);
@@ -323,13 +317,19 @@ fn main() -> Result<()> {
                     .partial_cmp(&b_secs)
                     .unwrap_or(std::cmp::Ordering::Equal)
             }
-            3 => {
+            2 => {
                 // FPS
                 let a_fps = a.0[sort_index].parse::<f64>().unwrap_or(0.0);
                 let b_fps = b.0[sort_index].parse::<f64>().unwrap_or(0.0);
                 a_fps
                     .partial_cmp(&b_fps)
                     .unwrap_or(std::cmp::Ordering::Equal)
+            }
+            3 => {
+                // Size
+                let a_bytes = parse_size(&a.0[sort_index]);
+                let b_bytes = parse_size(&b.0[sort_index]);
+                a_bytes.cmp(&b_bytes)
             }
             4 => {
                 // Bitrate
@@ -372,9 +372,9 @@ fn main() -> Result<()> {
     // Add header row
     table.add_row(Row::new(vec![
         Cell::new("Filename").with_style(Attr::Bold),
-        Cell::new("Size").with_style(Attr::Bold).style_spec("r"),
         Cell::new("Duration").with_style(Attr::Bold).style_spec("r"),
         Cell::new("FPS").with_style(Attr::Bold).style_spec("r"),
+        Cell::new("Size").with_style(Attr::Bold).style_spec("r"),
         Cell::new("Bitrate").with_style(Attr::Bold).style_spec("r"),
         Cell::new("Resolution").with_style(Attr::Bold),
         Cell::new("Format").with_style(Attr::Bold),
@@ -750,9 +750,6 @@ fn format_probe_output(
         filename_length,
     ));
 
-    // Get file size
-    fields.push(format_size(&probe.format.size));
-
     // Get duration
     fields.push(format_duration(&probe.format.duration));
 
@@ -780,6 +777,9 @@ fn format_probe_output(
             })
             .unwrap_or_default();
         fields.push(fps);
+
+        // Get file size
+        fields.push(format_size(&probe.format.size));
 
         // Get bitrate from format (more reliable than video stream bitrate)
         let bitrate = probe
